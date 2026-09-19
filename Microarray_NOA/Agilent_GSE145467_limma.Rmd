@@ -1,0 +1,331 @@
+---
+title: "Two-color Agilent microarray analysis with limma"
+subtitle: "GSE145467"
+date: "`r Sys.Date()`"
+output:
+  github_document:
+    toc: true
+    toc_depth: 3
+    html_preview: false
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 6
+)
+if (.Platform$OS.type == "windows") {
+  windowsFonts(Arial = windowsFont("Arial"))
+}
+```
+
+# Overview
+
+This notebook analyzes two-color Agilent arrays with [limma](https://bioconductor.org/packages/limma/).
+
+Expected files next to this notebook (or under the paths set below):
+
+| File / folder | Description |
+|---------------|-------------|
+| `pheno.txt` | limma targets file (`Cy5`, `Cy3`, file names) |
+| `spot.txt` | Spot-type file for control probes |
+| `GSE145467_RAW/` | Raw Agilent files listed in the targets file |
+
+Change `data_dir` if your files live somewhere else.
+
+# 1. Packages
+
+```{r install-packages, eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+BiocManager::install("limma")
+install.packages("ggplot2")
+```
+
+```{r libraries}
+library(limma)
+library(ggplot2)
+
+theme_set(
+  theme_bw(base_size = 13, base_family = "Arial") +
+    theme(
+      text = element_text(family = "Arial", color = "grey15"),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      panel.grid.minor = element_blank()
+    )
+)
+
+set_base_plot <- function() {
+  par(
+    family = "Arial",
+    las = 2,
+    cex.main = 1.1,
+    cex.lab = 1,
+    cex.axis = 0.85,
+    bty = "l",
+    mar = c(8, 5, 4, 2) + 0.1
+  )
+}
+
+group_palette <- c("#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#B279A2")
+```
+
+# 2. Paths and phenotype
+
+```{r paths}
+# Original analysis folder (change if needed)
+data_dir <- "C:/Users/Z/Desktop/Microarray_NOA"
+
+if (dir.exists(data_dir)) {
+  setwd(data_dir)
+}
+
+targets_file <- "pheno.txt"
+spot_file    <- "spot.txt"
+raw_dir      <- "GSE145467_RAW"
+
+cat("Working directory:\n", getwd(), "\n\n")
+print(list.files())
+
+if (!file.exists(targets_file)) {
+  stop("Cannot find ", targets_file, " in ", getwd())
+}
+if (!file.exists(spot_file)) {
+  stop("Cannot find ", spot_file, " in ", getwd())
+}
+if (!dir.exists(raw_dir)) {
+  stop("Cannot find folder ", raw_dir, " in ", getwd())
+}
+```
+
+```{r phenodata}
+phenodata <- readTargets(targets_file)
+
+# Clean Cy3 / Cy5 labels (encoding and non-alphanumeric characters)
+phenodata$Cy5 <- iconv(phenodata$Cy5, to = "UTF-8", sub = "")
+phenodata$Cy3 <- iconv(phenodata$Cy3, to = "UTF-8", sub = "")
+phenodata$Cy5 <- gsub("[^a-zA-Z0-9]", "", phenodata$Cy5)
+phenodata$Cy3 <- gsub("[^a-zA-Z0-9]", "", phenodata$Cy3)
+
+head(phenodata)
+```
+
+# 3. Read arrays
+
+```{r read-raw}
+data <- read.maimages(
+  files = phenodata,
+  source = "agilent",
+  path = raw_dir,
+  green.only = FALSE
+)
+```
+
+```{r plot-md-raw, fig.cap="MA plot of raw arrays"}
+set_base_plot()
+plotMD(data)
+```
+
+```{r spot-status}
+spot <- readSpotTypes(file = spot_file)
+data$genes$Status <- controlStatus(types = spot, genes = data)
+set_base_plot()
+plotMD(data)
+```
+
+# 4. Spot filter and weighted import
+
+Keep a spot if the foreground / background ratio is > 4.5 in Cy5 or Cy3.
+
+```{r filter-fun}
+filter <- function(x) {
+  R <- x[, "rMedianSignal"] / x[, "rBGMedianSignal"] > 4.5
+  G <- x[, "gMedianSignal"] / x[, "gBGMedianSignal"] > 4.5
+  as.numeric(R | G)
+}
+```
+
+```{r read-weighted}
+data2 <- read.maimages(
+  files = phenodata,
+  source = "agilent",
+  path = raw_dir,
+  green.only = FALSE,
+  wt.fun = filter
+)
+data2$genes$Status <- controlStatus(types = spot, genes = data2)
+```
+
+```{r plot-md-filtered, fig.cap="MA plot after spot weighting"}
+set_base_plot()
+plotMD(data2)
+```
+
+```{r raw-boxplots, fig.cap="Raw foreground and background intensities", fig.width=9, fig.height=16}
+stack_log <- function(mat, panel) {
+  df <- stack(as.data.frame(log2(mat)))
+  colnames(df) <- c("intensity", "sample")
+  df$panel <- panel
+  df
+}
+
+raw_long <- rbind(
+  stack_log(data2$G, "Cy3 foreground"),
+  stack_log(data2$Gb, "Cy3 background"),
+  stack_log(data2$R, "Cy5 foreground"),
+  stack_log(data2$Rb, "Cy5 background")
+)
+
+raw_long$panel <- factor(
+  raw_long$panel,
+  levels = c("Cy3 foreground", "Cy3 background", "Cy5 foreground", "Cy5 background")
+)
+raw_long$sample <- factor(raw_long$sample, levels = rev(colnames(data2$G)))
+
+fill_cols <- c(
+  "Cy3 foreground" = "#54A24B",
+  "Cy3 background" = "#B8E0A8",
+  "Cy5 foreground" = "#E45756",
+  "Cy5 background" = "#F4A3A3"
+)
+
+ggplot(raw_long, aes(x = sample, y = intensity, fill = panel)) +
+  geom_boxplot(color = "grey20", outlier.size = 0.4, show.legend = FALSE) +
+  scale_fill_manual(values = fill_cols) +
+  coord_flip() +
+  facet_wrap(~ panel, ncol = 1, scales = "free_x") +
+  labs(title = "Raw intensities", x = NULL, y = "log2 intensity") +
+  theme(
+    axis.text.y = element_text(family = "Arial", size = 7),
+    strip.text = element_text(family = "Arial", face = "bold")
+  )
+```
+
+# 5. Background correction and normalization
+
+```{r normalize}
+background_corrected <- backgroundCorrect(
+  RG = data2,
+  method = "normexp",
+  offset = 15
+)
+
+MA <- normalizeWithinArrays(background_corrected, method = "loess")
+norm_data <- normalizeBetweenArrays(object = MA, method = "quantile")
+```
+
+```{r plot-densities, fig.cap="Densities after normalization"}
+set_base_plot()
+plotDensities(norm_data)
+```
+
+```{r plot-m-boxplot, fig.cap="Normalized M-values", fig.width=9, fig.height=8}
+M_long <- stack(as.data.frame(norm_data$M))
+colnames(M_long) <- c("M", "sample")
+M_long$sample <- factor(M_long$sample, levels = rev(colnames(norm_data$M)))
+
+ggplot(M_long, aes(x = sample, y = M)) +
+  geom_boxplot(fill = "#72B7B2", color = "grey20", outlier.size = 0.6) +
+  coord_flip() +
+  labs(
+    title = "Normalized M-values",
+    x = NULL,
+    y = "M (log2 Cy5/Cy3)"
+  ) +
+  theme(
+    axis.text.y = element_text(family = "Arial", size = 8),
+    axis.text.x = element_text(family = "Arial", size = 10)
+  )
+```
+
+# 6. Average replicate probes
+
+```{r avereps}
+ave <- avereps(x = norm_data, ID = norm_data$genes$ProbeName)
+```
+
+# 7. Linear model and contrast
+
+Reference group in the targets file: `Control`.  
+The contrast of interest is `impaired - normal`.
+
+```{r model}
+design <- modelMatrix(targets = phenodata, ref = "Control")
+fit <- lmFit(object = ave, design = design)
+
+contrast <- makeContrasts(
+  contrasts = c("impaired", "normal", "impaired-normal"),
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit = fit, contrasts = contrast)
+fit3 <- eBayes(fit2)
+```
+
+```{r toptable}
+tt <- topTable(
+  fit = fit3,
+  number = Inf,
+  adjust.method = "fdr",
+  coef = "impaired-normal",
+  sort.by = "logFC"
+)
+
+sig <- subset(tt, adj.P.Val < 0.05)
+write.table(sig, "DEG_impaired_vs_normal.txt", quote = FALSE, sep = "\t")
+
+up <- subset(sig, logFC > 1)
+up <- subset(up, select = intersect(c("GeneName", "adj.P.Val", "logFC"), colnames(up)))
+write.table(up, "DEG_up_logFC_gt1.txt", quote = FALSE, sep = "\t")
+
+head(sig)
+nrow(sig)
+nrow(up)
+```
+
+# 8. PCA
+
+```{r sample-groups}
+samp_groups <- factor(phenodata$Cy5)
+samp_cols <- group_palette[seq_along(levels(samp_groups))]
+names(samp_cols) <- levels(samp_groups)
+```
+
+```{r pca, fig.cap="PCA of averaged M-values"}
+M <- ave$M
+keep <- complete.cases(M)
+pca <- prcomp(t(M[keep, , drop = FALSE]), scale. = TRUE)
+pct <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  group = samp_groups[match(rownames(pca$x), colnames(M))]
+)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 3.5, alpha = 0.9) +
+  geom_text(aes(label = group), family = "Arial", size = 3.2, vjust = -1, show.legend = FALSE) +
+  scale_color_manual(values = samp_cols) +
+  labs(
+    title = "PCA of averaged M-values",
+    x = paste0("PC1 (", round(pct[1], 1), "%)"),
+    y = paste0("PC2 (", round(pct[2], 1), "%)"),
+    color = "Group"
+  )
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
