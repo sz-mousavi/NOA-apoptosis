@@ -1,0 +1,954 @@
+---
+title: "Single-cell analysis of human spermatogenesis"
+output:
+  github_document:
+    toc: true
+    toc_depth: 3
+    html_preview: false
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+# Overview
+
+This notebook organizes the single-cell RNA-seq analysis used for the human spermatogenesis dataset. The workflow starts from sparse count matrices, builds Seurat objects, performs quality control and integration, examines the integrated cell populations, and then continues with marker analysis, cell-cycle scoring, differential expression, and pseudotime analysis.
+
+Expected local layout (relative to this notebook):
+
+```text
+.
+├── SPM.Rmd
+├── README.md
+└── data/
+    ├── Mitogene.csv
+    ├── counts/            # Sparse_SRR*.tsv.gz files
+    └── state_objects/     # optional .h5seurat checkpoints
+```
+
+Large count matrices and Seurat objects are not stored in this repository. Place them under `data/` before running the notebook.
+
+Some later steps are interactive (`CellSelector()`, Monocle `order_cells()`). Those chunks are left as `eval=FALSE` so the source notebook can be posted without requiring a full local run.
+
+# Setup
+
+## Packages
+
+```{r setup, message=FALSE, warning=FALSE}
+library(Seurat)
+library(SeuratDisk)
+library(SeuratWrappers)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(EnsDb.Hsapiens.v86)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library(ggVennDiagram)
+library(monocle3)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## File locations
+
+Keeping the main directories in one place makes the analysis easier to move between systems.
+
+```{r paths}
+project_dir   <- "."
+counts_dir    <- file.path("data", "counts")
+state_dir     <- file.path("data", "state_objects")
+mitogene_file <- file.path("data", "Mitogene.csv")
+
+dir.create(counts_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(state_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(project_dir, "results"), recursive = TRUE, showWarnings = FALSE)
+```
+
+# 1. Build the initial Seurat objects
+
+## Read count matrices
+
+The ten sparse count tables represent different spermatogenic samples or enriched cell populations.
+
+```{r read-counts}
+files <- c(
+  "Sparse_SRR6459187.tsv.gz",
+  "Sparse_SRR6459188.tsv.gz",
+  "Sparse_SRR6459189.tsv.gz",
+  "Sparse_SRR6459190.tsv.gz",
+  "Sparse_SRR6459191.tsv.gz",
+  "Sparse_SRR6459192.tsv.gz",
+  "Sparse_SRR6459193.tsv.gz",
+  "Sparse_SRR6459194.tsv.gz",
+  "Sparse_SRR7553900.tsv.gz",
+  "Sparse_SRR7553901.tsv.gz"
+)
+
+count_tables <- vector("list", length(files))
+
+for (i in seq_along(files)) {
+  x <- read.delim(file.path(counts_dir, files[i]))
+  rownames(x) <- x[, 1]
+  count_tables[[i]] <- x[, -1]
+}
+```
+
+## Create one Seurat object per input dataset
+
+```{r create-seurat-objects}
+project_names <- c(
+  "HumanSpermatogonia_17-1",
+  "HumanSpermatogonia_17-2",
+  "HumanSpermatogonia_17-5",
+  "AdultHuman_17_3",
+  "AdultHuman_17_4",
+  "AdultHuman_17_5",
+  "AdultHuman_Spermatocytes_17_6",
+  "AdultHuman_Spermatids_17_6",
+  "AdultHuman_Spermatocytes_17_11",
+  "AdultHuman_Spermatids_17_11"
+)
+
+seurat_objects <- vector("list", length(files))
+
+for (i in seq_along(files)) {
+  seurat_objects[[i]] <- CreateSeuratObject(
+    counts = count_tables[[i]],
+    project = project_names[i],
+    min.cells = 3,
+    min.features = 200
+  )
+}
+```
+
+Saving these objects is optional but useful when the raw input step is expensive.
+
+```{r save-initial-objects, eval=FALSE}
+for (i in seq_along(seurat_objects)) {
+  SaveH5Seurat(seurat_objects[[i]])
+}
+```
+
+# 2. Combine related samples
+
+The input datasets are combined into four broad groups: spermatogonia (SPG), mixed spermatogenic cells (SPM), spermatocytes (SPC), and spermatids (SPT).
+
+```{r merge-samples}
+Data <- list(
+  SPG = merge(
+    seurat_objects[[1]],
+    y = c(seurat_objects[[2]], seurat_objects[[3]]),
+    add.cell.ids = c("SPG1", "SPG2", "SPG3"),
+    project = "Spermatogonia"
+  ),
+  SPM = merge(
+    seurat_objects[[4]],
+    y = c(seurat_objects[[5]], seurat_objects[[6]]),
+    add.cell.ids = c("SPM1", "SPM2", "SPM3"),
+    project = "Spermatogenesis"
+  ),
+  SPC = merge(
+    seurat_objects[[7]],
+    y = seurat_objects[[9]],
+    add.cell.ids = c("SPC1", "SPC2"),
+    project = "Spermatocyte"
+  ),
+  SPT = merge(
+    seurat_objects[[8]],
+    y = seurat_objects[[10]],
+    add.cell.ids = c("SPT1", "SPT2"),
+    project = "Spermatid"
+  )
+)
+
+for (group_name in names(Data)) {
+  Data[[group_name]]$group <- group_name
+  Data[[group_name]] <- JoinLayers(Data[[group_name]], assay = "RNA")
+}
+```
+
+If intermediate H5Seurat files are needed, they can be saved here.
+
+```{r save-merged-objects, eval=FALSE}
+state_files <- c(
+  SPG = "spermatogonia.h5seurat",
+  SPM = "spermatogenesis.h5seurat",
+  SPC = "spermatocyte.h5seurat",
+  SPT = "spermatid.h5seurat"
+)
+
+for (group_name in names(Data)) {
+  SaveH5Seurat(
+    Data[[group_name]],
+    filename = file.path(state_dir, state_files[group_name])
+  )
+}
+```
+
+# 3. Quality control
+
+If the merged objects have already been saved, the analysis can resume from this point instead of rebuilding them from the raw count tables.
+
+```{r load-merged-objects, eval=FALSE}
+state_files <- c(
+  SPG = "spermatogonia.h5seurat",
+  SPM = "spermatogenesis.h5seurat",
+  SPC = "spermatocyte.h5seurat",
+  SPT = "spermatid.h5seurat"
+)
+
+Data <- lapply(state_files, function(x) {
+  LoadH5Seurat(file.path(state_dir, x))
+})
+```
+
+## Median absolute deviation
+
+The original filtering strategy uses five median absolute deviations around the median for both detected features and total RNA counts.
+
+```{r qc-mad}
+MAD <- function(x) {
+  median(abs(x - median(x)))
+}
+
+feature_mad <- sapply(Data, function(x) MAD(x$nFeature_RNA))
+count_mad   <- sapply(Data, function(x) MAD(x$nCount_RNA))
+```
+
+## Mitochondrial RNA percentage
+
+The mitochondrial gene list is converted to Ensembl gene identifiers before calculating the percentage of counts assigned to mitochondrial genes.
+
+```{r mitochondrial-ratio}
+mitogene <- read.csv(mitogene_file, header = FALSE)
+
+MT <- mapIds(
+  EnsDb.Hsapiens.v86,
+  keys = mitogene$V1,
+  keytype = "GENENAME",
+  column = "GENEID"
+)
+
+for (i in seq_along(Data)) {
+  mt_features <- intersect(
+    unname(MT)[!is.na(MT)],
+    rownames(Data[[i]])
+  )
+
+  Data[[i]][["MitoRatio"]] <- PercentageFeatureSet(
+    Data[[i]],
+    features = mt_features,
+    assay = "RNA"
+  )
+}
+
+mito_mad <- sapply(Data, function(x) MAD(x$MitoRatio))
+```
+
+## Inspect QC distributions
+
+```{r qc-violin, fig.width=12, fig.height=8}
+state_names <- c(
+  SPG = "Spermatogonia",
+  SPM = "Spermatogenic cells",
+  SPC = "Spermatocytes",
+  SPT = "Spermatids"
+)
+
+qc_violin <- lapply(names(Data), function(group_name) {
+  obj <- Data[[group_name]]
+  obj$state <- state_names[group_name]
+
+  VlnPlot(
+    obj,
+    features = c("nFeature_RNA", "nCount_RNA", "MitoRatio"),
+    ncol = 3,
+    pt.size = 1e-6
+  ) + NoLegend()
+})
+
+wrap_plots(qc_violin, ncol = 1)
+```
+
+The scatter plots are useful for checking whether unusually high RNA counts are accompanied by unusually high feature numbers or mitochondrial content.
+
+```{r qc-scatter, fig.width=10, fig.height=8}
+count_mito_plots <- lapply(Data, function(obj) {
+  FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "MitoRatio")
+})
+
+count_feature_plots <- lapply(Data, function(obj) {
+  FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+})
+
+wrap_plots(count_mito_plots, ncol = 2)
+wrap_plots(count_feature_plots, ncol = 2)
+```
+
+Density plots show the upper five-MAD threshold used later for filtering.
+
+```{r qc-density, fig.width=14, fig.height=7}
+qc_data <- lapply(Data, function(obj) {
+  data.frame(
+    nFeature_RNA = obj$nFeature_RNA,
+    nCount_RNA = obj$nCount_RNA,
+    MitoRatio = obj$MitoRatio,
+    sample = obj$orig.ident
+  )
+})
+
+feature_plots <- lapply(seq_along(Data), function(i) {
+  df <- qc_data[[i]]
+
+  ggplot(df, aes(x = nFeature_RNA)) +
+    geom_density(fill = "beige") +
+    geom_vline(
+      xintercept = median(df$nFeature_RNA) + 5 * feature_mad[i]
+    ) +
+    labs(
+      title = paste("Detected features:", state_names[i]),
+      x = "Number of features",
+      y = "Density"
+    ) +
+    theme_bw()
+})
+
+count_plots <- lapply(seq_along(Data), function(i) {
+  df <- qc_data[[i]]
+
+  ggplot(df, aes(x = nCount_RNA)) +
+    geom_density(fill = "beige") +
+    geom_vline(
+      xintercept = median(df$nCount_RNA) + 5 * count_mad[i]
+    ) +
+    labs(
+      title = paste("RNA counts:", state_names[i]),
+      x = "Number of counts",
+      y = "Density"
+    ) +
+    theme_bw()
+})
+
+wrap_plots(c(feature_plots, count_plots), ncol = 4, nrow = 2)
+```
+
+# 4. Filter cells and genes
+
+Cells are retained when feature and count values fall within five MADs of the corresponding median and mitochondrial RNA is below 10%.
+
+```{r filter-cells}
+for (i in seq_along(Data)) {
+  feature_med <- median(Data[[i]]$nFeature_RNA)
+  count_med <- median(Data[[i]]$nCount_RNA)
+
+  Data[[i]] <- subset(
+    Data[[i]],
+    subset =
+      nFeature_RNA > feature_med - 5 * feature_mad[i] &
+      nFeature_RNA < feature_med + 5 * feature_mad[i] &
+      nCount_RNA > count_med - 5 * count_mad[i] &
+      nCount_RNA < count_med + 5 * count_mad[i] &
+      MitoRatio < 10
+  )
+}
+```
+
+The original script also removes genes detected in fewer than 1% of cells. The version below performs the same calculation using the RNA count layer rather than editing assay slots directly.
+
+```{r filter-low-expression-genes}
+for (i in seq_along(Data)) {
+  counts <- GetAssayData(Data[[i]], assay = "RNA", layer = "counts")
+  detected_cells <- Matrix::rowSums(counts > 0)
+  keep_features <- names(detected_cells)[detected_cells >= 0.01 * ncol(Data[[i]])]
+
+  Data[[i]] <- subset(Data[[i]], features = keep_features)
+}
+```
+
+# 5. Normalize and integrate datasets
+
+```{r normalize-variable-features}
+for (i in seq_along(Data)) {
+  Data[[i]] <- NormalizeData(
+    Data[[i]],
+    normalization.method = "LogNormalize",
+    scale.factor = 10000
+  )
+
+  Data[[i]] <- FindVariableFeatures(
+    Data[[i]],
+    selection.method = "vst",
+    nfeatures = 2000
+  )
+}
+```
+
+```{r integrate-data}
+Data.anchors <- FindIntegrationAnchors(object.list = Data)
+CData <- IntegrateData(anchorset = Data.anchors)
+```
+
+```{r save-integrated-object, eval=FALSE}
+SaveH5Seurat(
+  CData,
+  filename = file.path(project_dir, "SeuratProject.h5Seurat")
+)
+```
+
+# 6. Dimensionality reduction and clustering
+
+If the integrated object has already been saved, it can be loaded directly here.
+
+```{r load-integrated-object, eval=FALSE}
+CData <- LoadH5Seurat(
+  file.path(project_dir, "SeuratProject.h5Seurat"),
+  images = FALSE
+)
+```
+
+```{r pca-umap-clustering}
+CData <- ScaleData(CData)
+CData <- RunPCA(CData, verbose = FALSE)
+CData <- RunUMAP(CData, reduction = "pca", dims = 1:30, verbose = FALSE)
+CData <- FindNeighbors(CData, reduction = "pca", dims = 1:30)
+CData <- FindClusters(CData, resolution = 0.2)
+
+DimPlot(CData, reduction = "umap", label = TRUE, label.size = 3) +
+  NoLegend()
+```
+
+The original figure orientation was changed by reversing both UMAP axes. This only changes presentation; it does not alter neighborhood relationships or clustering.
+
+```{r orient-umap}
+CData@reductions[["umap"]]@cell.embeddings[, 1] <-
+  -CData@reductions[["umap"]]@cell.embeddings[, 1]
+
+CData@reductions[["umap"]]@cell.embeddings[, 2] <-
+  -CData@reductions[["umap"]]@cell.embeddings[, 2]
+```
+
+# 7. Assign biological cluster labels
+
+These labels reproduce the manually assigned cluster identities used in the original analysis. They assume the cluster numbering is unchanged from the clustering step above.
+
+```{r cluster-labels}
+cluster_labels <- c(
+  "Undiff.SPG-1",
+  "Undiff.SPG-2",
+  "Round.SPT-2",
+  "Round.SPT-1",
+  "Diff.ing.SPG-2",
+  "Pachytene.SPC-1",
+  "Elongating.SPT",
+  "Pachytene.SPC-2",
+  "Diplotene & Sec.SPC",
+  "Late.Zyg,Early.pach.SPC",
+  "Diff.ing.SPG-1",
+  "Lept,Eraly.Zyg.SPC",
+  "Somatic",
+  "Somatic"
+)
+
+levels(Idents(CData)) <- cluster_labels
+levels(CData$seurat_clusters) <- cluster_labels
+
+cell_type_order <- c(
+  "Undiff.SPG-1",
+  "Undiff.SPG-2",
+  "Diff.ing.SPG-1",
+  "Diff.ing.SPG-2",
+  "Lept,Eraly.Zyg.SPC",
+  "Late.Zyg,Early.pach.SPC",
+  "Pachytene.SPC-1",
+  "Pachytene.SPC-2",
+  "Diplotene & Sec.SPC",
+  "Round.SPT-1",
+  "Round.SPT-2",
+  "Elongating.SPT",
+  "Somatic"
+)
+
+Idents(CData) <- factor(Idents(CData), levels = cell_type_order)
+CData$seurat_clusters <- factor(CData$seurat_clusters, levels = cell_type_order)
+
+table(Idents(CData))
+```
+
+## Cell numbers per cluster
+
+```{r export-cluster-counts, eval=FALSE}
+cluster_table <- table(CData$seurat_clusters)
+cluster_counts <- data.frame(
+  Cluster = names(cluster_table),
+  Cells = as.integer(cluster_table)
+)
+
+writexl::write_xlsx(
+  cluster_counts,
+  file.path(project_dir, "CData_cells_per_cluster.xlsx")
+)
+```
+
+# 8. Remove somatic cells and manually selected outliers
+
+The germ-cell object excludes clusters annotated as somatic.
+
+```{r germ-cell-subset}
+GCData <- subset(CData, idents = "Somatic", invert = TRUE)
+```
+
+The original workflow then used `CellSelector()` to manually draw a polygon around an isolated group of cells. Because that step is interactive, it should be run manually and the resulting object saved before continuing with a fully reproducible report.
+
+```{r manual-outlier-removal, eval=FALSE}
+p <- DimPlot(GCData, reduction = "umap")
+cells_to_drop <- CellSelector(p)
+
+GCData <- subset(
+  GCData,
+  cells = setdiff(Cells(GCData), cells_to_drop)
+)
+
+SaveH5Seurat(
+  GCData,
+  filename = file.path(project_dir, "GCData.h5Seurat")
+)
+```
+
+```{r load-germ-cell-object, eval=FALSE}
+GCData <- LoadH5Seurat(
+  file.path(project_dir, "GCData.h5Seurat"),
+  images = FALSE
+)
+```
+
+# 9. Examine dataset composition after integration
+
+```{r group-umap}
+GCData$group <- factor(GCData$group, levels = c("SPM", "SPG", "SPC", "SPT"))
+
+DimPlot(
+  GCData,
+  reduction = "umap",
+  group.by = "group",
+  split.by = "group",
+  label.size = 3.5
+) +
+  theme(panel.background = element_rect(fill = "white", colour = "black")) +
+  NoLegend()
+```
+
+```{r integrated-qc-plots}
+VlnPlot(
+  CData,
+  features = c("nFeature_RNA", "nCount_RNA", "MitoRatio"),
+  ncol = 3,
+  pt.size = 0.001
+)
+
+FeatureScatter(
+  CData,
+  feature1 = "nFeature_RNA",
+  feature2 = "nCount_RNA",
+  group.by = "seurat_clusters"
+)
+```
+
+# 10. Marker-gene visualization
+
+## Map gene symbols to Ensembl identifiers
+
+A short helper keeps the plotting code readable and avoids changing row names inside the Seurat assay.
+
+```{r gene-mapping}
+map_to_ensembl <- function(symbols) {
+  ids <- mapIds(
+    EnsDb.Hsapiens.v86,
+    keys = symbols,
+    keytype = "GENENAME",
+    column = "GENEID"
+  )
+
+  ids[!is.na(ids)]
+}
+```
+
+## Example: DDX4
+
+```{r ddx4}
+DDX4 <- map_to_ensembl("DDX4")
+
+FeaturePlot(CData, features = unname(DDX4)) +
+  labs(title = "DDX4")
+```
+
+## Candidate gene sets
+
+Several gene sets were tested during the original analysis. Keep the set relevant to the figure being generated.
+
+```{r candidate-genes}
+
+tnfr_genes <- c("TNFRSF1A", "RIPK1", "TRADD")
+```
+
+Choose the gene set for the current analysis.
+
+```{r choose-gene-set}
+Genes <- selected_genes
+EnsGenes <- map_to_ensembl(Genes)
+```
+
+## Feature plots
+
+```{r marker-feature-plots, fig.width=10, fig.height=8}
+feature_plots <- lapply(seq_along(EnsGenes), function(i) {
+  FeaturePlot(CData, features = unname(EnsGenes[i])) +
+    labs(title = names(EnsGenes)[i])
+})
+
+wrap_plots(feature_plots, ncol = 3)
+```
+
+## Violin plots
+
+```{r marker-violin-plots, fig.width=10, fig.height=8}
+violin_plots <- lapply(seq_along(EnsGenes), function(i) {
+  VlnPlot(CData, features = unname(EnsGenes[i]), pt.size = 0) +
+    labs(title = names(EnsGenes)[i])
+})
+
+wrap_plots(violin_plots, ncol = 3)
+```
+
+## Dot plot
+
+```{r marker-dotplot, fig.width=9, fig.height=6}
+DotPlot(
+  GCData,
+  features = unname(EnsGenes),
+  assay = "RNA",
+  cols = c("#EDE7F6", "#6A00FF")
+) +
+  scale_x_discrete(labels = names(EnsGenes)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(x = "Genes", y = "Cell type")
+```
+
+# 11. Cell-cycle analysis in spermatogonia
+
+The cell-cycle analysis focuses on undifferentiated and differentiating spermatogonial clusters.
+
+```{r spg-subset}
+SPG <- subset(
+  CData,
+  idents = c(
+    "Undiff.SPG-1",
+    "Undiff.SPG-2",
+    "Diff.ing.SPG-1",
+    "Diff.ing.SPG-2"
+  )
+)
+
+DimPlot(SPG)
+```
+
+The original analysis used `CollapseEmbeddingOutliers()` and removed cells beyond a selected UMAP coordinate. This is retained as an optional preprocessing step because the threshold is specific to the existing embedding.
+
+```{r spg-outlier-step, eval=FALSE}
+SPG_out <- CollapseEmbeddingOutliers(
+  SPG,
+  reduction = "umap",
+  reduction.key = "UMAP_"
+)
+
+SPG <- SPG[, !colnames(SPG) %in%
+  names(which(SPG_out@cell.embeddings[, 1] > -1))]
+```
+
+## Prepare S- and G2/M-phase genes
+
+```{r cell-cycle-genes}
+S_genes <- mapIds(
+  EnsDb.Hsapiens.v86,
+  keys = cc.genes$s.genes,
+  keytype = "GENENAME",
+  column = "GENEID"
+)
+
+G2M_genes <- mapIds(
+  EnsDb.Hsapiens.v86,
+  keys = cc.genes$g2m.genes,
+  keytype = "GENENAME",
+  column = "GENEID"
+)
+
+S_genes <- unname(S_genes[!is.na(S_genes)])
+G2M_genes <- unname(G2M_genes[!is.na(G2M_genes)])
+```
+
+```{r cell-cycle-scoring}
+SPG <- CellCycleScoring(
+  SPG,
+  s.features = S_genes,
+  g2m.features = G2M_genes,
+  set.ident = TRUE
+)
+
+SPG <- RunPCA(SPG, features = c(S_genes, G2M_genes))
+
+DimPlot(SPG, split.by = "Phase", label = TRUE)
+```
+
+## Cell-cycle scores and phase composition
+
+```{r cell-cycle-plots, fig.width=10, fig.height=6}
+cell_cycle_df <- data.frame(
+  Phase = SPG$Phase,
+  S = SPG$S.Score,
+  G2M = SPG$G2M.Score,
+  Cluster = SPG$old.ident
+)
+
+p_phase <- ggplot(cell_cycle_df, aes(x = S, y = G2M, colour = Phase)) +
+  geom_point() +
+  theme_bw()
+
+p_cluster <- ggplot(cell_cycle_df, aes(x = S, y = G2M, colour = Cluster)) +
+  geom_point() +
+  theme_bw()
+
+phase_composition <- cell_cycle_df %>%
+  group_by(Cluster, Phase) %>%
+  count() %>%
+  group_by(Cluster) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x = Cluster, y = percent, fill = Phase)) +
+  geom_col() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(y = "Cells (%)")
+
+p_phase | p_cluster
+phase_composition
+```
+
+# 12. Spermatogonial marker panels
+
+```{r spermatogonia-marker-sets}
+A_dark <- c(
+  "POU2F2", "GFRA1", "FGFR3", "MAGEA4",
+  "ZBTB16", "SALL4", "UCHL1", "UTF1"
+)
+
+A_pale <- c(
+  "DMRT1", "GFRA1", "FGFR3", "MAGEA4", "ZBTB16",
+  "SSX3", "KIT", "SALL4", "UCHL1", "UTF1"
+)
+
+B_type <- c("DMRT1", "MAGEA4", "SAGE1", "SSX3", "KIT", "SALL4")
+
+spg_markers <- union(union(A_dark, A_pale), B_type)
+spg_marker_ids <- map_to_ensembl(spg_markers)
+```
+
+```{r spermatogonia-feature-plots, fig.width=12, fig.height=10}
+spg_feature_plots <- lapply(seq_along(spg_marker_ids), function(i) {
+  FeaturePlot(SPG, features = unname(spg_marker_ids[i])) +
+    labs(title = names(spg_marker_ids)[i])
+})
+
+wrap_plots(spg_feature_plots, ncol = 4)
+```
+
+A smaller panel used in the original analysis can be plotted separately.
+
+```{r selected-spg-markers}
+selected_spg <- c("UTF1", "ID4", "MAGEA4", "DMRT1")
+selected_spg_ids <- map_to_ensembl(selected_spg)
+
+selected_spg_plots <- lapply(seq_along(selected_spg_ids), function(i) {
+  FeaturePlot(SPG, features = unname(selected_spg_ids[i])) +
+    labs(title = names(selected_spg_ids)[i])
+})
+
+wrap_plots(selected_spg_plots, ncol = 4)
+```
+
+## Mitotic markers
+
+```{r mitosis-markers}
+mitosis_markers <- c("MKI67", "TOP2A", "CDK1", "CDC20", "CCNB2", "NANOS3")
+mitosis_ids <- map_to_ensembl(mitosis_markers)
+
+mitosis_plots <- lapply(seq_along(mitosis_ids), function(i) {
+  FeaturePlot(SPG, features = unname(mitosis_ids[i])) +
+    labs(title = names(mitosis_ids)[i])
+})
+
+wrap_plots(mitosis_plots, ncol = 3)
+```
+
+# 13. Differential expression
+
+Differentially expressed genes are identified for all germ-cell clusters using the thresholds from the original script.
+
+```{r differential-expression}
+DEG <- FindAllMarkers(
+  GCData,
+  logfc.threshold = 0.5,
+  min.pct = 0.1
+)
+
+DEG$SYMBOL <- mapIds(
+  EnsDb.Hsapiens.v86,
+  keys = DEG$gene,
+  keytype = "GENEID",
+  column = "GENENAME"
+)
+
+DEG$ENTREZ <- mapIds(
+  EnsDb.Hsapiens.v86,
+  keys = DEG$gene,
+  keytype = "GENEID",
+  column = "ENTREZID"
+)
+
+DEG <- DEG[order(DEG$cluster, DEG$avg_log2FC, decreasing = TRUE), ]
+```
+
+The original script also defined a custom cluster order before concatenating marker tables.
+
+```{r ordered-deg}
+cluster_order_index <- c(13, 12, 3, 9, 2, 8, 5, 4, 7, 11, 6, 10, 1)
+cluster_order_index <- cluster_order_index[
+  cluster_order_index <= length(unique(DEG$cluster))
+]
+
+ordered_clusters <- unique(DEG$cluster)[cluster_order_index]
+
+Ordered.DEG <- bind_rows(
+  lapply(ordered_clusters, function(cluster_name) {
+    DEG[DEG$cluster == cluster_name, ]
+  })
+)
+```
+
+```{r export-deg, eval=FALSE}
+writexl::write_xlsx(
+  DEG,
+  file.path(project_dir, "results", "DEG.xlsx")
+)
+```
+
+# 14. Pseudotime analysis
+
+The Seurat germ-cell object is converted to a Monocle 3 `cell_data_set`. The existing Seurat UMAP coordinates and cluster assignments are then transferred to Monocle before learning the principal graph.
+
+```{r seurat-to-monocle}
+cds <- as.cell_data_set(GCData, assay = "RNA")
+reducedDim(cds, "UMAP") <- Embeddings(GCData, "umap")
+
+recreated_partition <- factor(rep(1, ncol(cds)))
+names(recreated_partition) <- colnames(cds)
+cds@clusters[["UMAP"]][["partitions"]] <- recreated_partition
+
+seurat_clusters <- Idents(GCData)
+names(seurat_clusters) <- colnames(GCData)
+cds@clusters[["UMAP"]][["clusters"]] <- seurat_clusters
+
+plot_cells(cds, show_trajectory_graph = FALSE)
+```
+
+## Learn the trajectory
+
+`order_cells()` is interactive when a root is not specified programmatically. The selected root therefore remains a user-defined step in this version, matching the original workflow.
+
+```{r learn-trajectory}
+cds <- learn_graph(cds, use_partition = FALSE, verbose = FALSE)
+plot_cells(cds, color_cells_by = "cluster")
+```
+
+```{r order-cells, eval=FALSE}
+cds <- order_cells(cds)
+
+plot_cells(
+  cds,
+  color_cells_by = "pseudotime",
+  label_cell_groups = FALSE,
+  label_leaves = FALSE,
+  label_branch_points = FALSE,
+  graph_label_size = 1.5
+)
+```
+
+# 15. Genes associated with the trajectory
+
+```{r trajectory-gene-annotation}
+rowData(cds)$gene_name <- rownames(cds)
+rowData(cds)$gene_short_name <- rowData(cds)$gene_name
+
+mapped_names <- names(EnsGenes)
+mapped_ids <- unname(EnsGenes)
+
+idx <- match(rownames(rowData(cds)), mapped_ids)
+keep <- !is.na(idx)
+rowData(cds)$gene_name[keep] <- mapped_names[idx[keep]]
+```
+
+```{r trajectory-marker-plots}
+plot_cells(
+  cds,
+  genes = mapped_ids,
+  show_trajectory_graph = TRUE,
+  label_cell_groups = FALSE,
+  label_leaves = FALSE
+)
+```
+
+## Graph-based test
+
+```{r graph-test}
+res <- graph_test(
+  cds,
+  neighbor_graph = "principal_graph",
+  cores = 4
+)
+
+res <- res[res$status == "OK", ]
+res <- res[order(res$p_value), ]
+
+res$symbol <- mapIds(
+  EnsDb.Hsapiens.v86,
+  keys = res$gene_short_name,
+  keytype = "GENEID",
+  column = "SYMBOL"
+)
+```
+
+## Expression of selected genes across pseudotime
+
+This final plot requires the cells to have been ordered in the previous interactive step.
+
+```{r genes-in-pseudotime, eval=FALSE}
+lineage_cds <- cds[
+  rowData(cds)$gene_short_name %in% mapped_ids,
+]
+
+lineage_cds <- order_cells(lineage_cds)
+
+plot_genes_in_pseudotime(
+  lineage_cds,
+  color_cells_by = "pseudotime",
+  cell_size = 0.5,
+  ncol = 3,
+  nrow = 4
+)
+```
