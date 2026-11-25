@@ -31,7 +31,7 @@ if (.Platform$OS.type == "windows") {
 
 This notebook analyzes two-color Agilent arrays with [limma](https://bioconductor.org/packages/limma/).
 
-Expected files next to this notebook (or under the paths set below):
+Expected files in `data/GSE145467/` (relative to this notebook):
 
 | File / folder | Description |
 |---------------|-------------|
@@ -39,7 +39,7 @@ Expected files next to this notebook (or under the paths set below):
 | `spot.txt` | Spot-type file for control probes |
 | `GSE145467_RAW/` | Raw Agilent files listed in the targets file |
 
-Change `data_dir` if your files live somewhere else.
+Change `data_dir` (and `results_dir`) in the chunk "Paths and phenotype" below if your files live somewhere else. See the repository `README.md` for how to obtain the data from GEO.
 
 # 1. Packages
 
@@ -82,28 +82,27 @@ group_palette <- c("#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#B279
 # 2. Paths and phenotype
 
 ```{r paths}
-# Original analysis folder (change if needed)
-data_dir <- "C:/Users/Z/Desktop/Microarray_NOA"
+# Input and output folders, relative to this notebook. Change if needed.
+data_dir    <- file.path("data", "GSE145467")  # contains pheno.txt, spot.txt, GSE145467_RAW/
+results_dir <- "results"                       # output tables are written here
 
-if (dir.exists(data_dir)) {
-  setwd(data_dir)
-}
+targets_file <- file.path(data_dir, "pheno.txt")
+spot_file    <- file.path(data_dir, "spot.txt")
+raw_dir      <- file.path(data_dir, "GSE145467_RAW")
 
-targets_file <- "pheno.txt"
-spot_file    <- "spot.txt"
-raw_dir      <- "GSE145467_RAW"
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
 cat("Working directory:\n", getwd(), "\n\n")
-print(list.files())
+print(list.files(data_dir))
 
 if (!file.exists(targets_file)) {
-  stop("Cannot find ", targets_file, " in ", getwd())
+  stop("Cannot find ", targets_file, " (working directory: ", getwd(), ")")
 }
 if (!file.exists(spot_file)) {
-  stop("Cannot find ", spot_file, " in ", getwd())
+  stop("Cannot find ", spot_file, " (working directory: ", getwd(), ")")
 }
 if (!dir.exists(raw_dir)) {
-  stop("Cannot find folder ", raw_dir, " in ", getwd())
+  stop("Cannot find folder ", raw_dir, " (working directory: ", getwd(), ")")
 }
 ```
 
@@ -281,11 +280,11 @@ tt <- topTable(
 )
 
 sig <- subset(tt, adj.P.Val < 0.05)
-write.table(sig, "DEG_impaired_vs_normal.txt", quote = FALSE, sep = "\t")
+write.table(sig, file.path(results_dir, "DEG_impaired_vs_normal.txt"), quote = FALSE, sep = "\t")
 
 up <- subset(sig, logFC > 1)
 up <- subset(up, select = intersect(c("GeneName", "adj.P.Val", "logFC"), colnames(up)))
-write.table(up, "DEG_up_logFC_gt1.txt", quote = FALSE, sep = "\t")
+write.table(up, file.path(results_dir, "DEG_up_logFC_gt1.txt"), quote = FALSE, sep = "\t")
 
 head(sig)
 nrow(sig)
