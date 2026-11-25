@@ -32,14 +32,14 @@ if (.Platform$OS.type == "windows") {
 
 This notebook performs differential expression analysis on bulk RNA-seq count data using [DESeq2](https://bioconductor.org/packages/DESeq2/).
 
-**Expected input files (same folder as this `.Rmd`):**
+**Expected input files (in `data/GSE190752/`, relative to this `.Rmd`):**
 
 | File | Description |
 |------|-------------|
-| `counts.txt` | Gene count matrix (genes as rows, samples as columns) |
-| `Pheno.txt` | Sample metadata / phenotype table (samples as rows) |
+| `counts.txt` | Gene count matrix (tab-separated; genes as rows, samples as columns) |
+| `Pheno.txt` | Sample metadata / phenotype table (tab-separated; samples as rows, with a `status` column) |
 
-> **Note:** Change the working directory and file names if your paths differ. The original script used a Windows path (`C:/Users/...`). For GitHub and reproducibility, keep the data files next to the notebook or use a relative path.
+> **Note:** All paths are relative to the folder that contains this notebook. To use another location, change `data_dir` (and `results_dir`) in the chunk "Working directory and input data" below. See the repository `README.md` for how to obtain the data from GEO.
 
 ---
 
@@ -71,26 +71,26 @@ theme_set(
 # 2. Working directory and input data
 
 ```{r paths}
-# Folder that contains count.txt and Pheno.txt
-data_dir <- "C:/Users/Z/Desktop/GSE190752/"
-if (dir.exists(data_dir)) {
-  setwd(data_dir)
-}
+# Input and output folders, relative to this notebook. Change if needed.
+data_dir    <- file.path("data", "GSE190752")  # contains counts.txt and Pheno.txt
+results_dir <- "results"                       # output tables are written here
 
-count_file <- "counts.txt"
-pheno_file <- "Pheno.txt"
+count_file <- file.path(data_dir, "counts.txt")
+pheno_file <- file.path(data_dir, "Pheno.txt")
+
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
 cat("Working directory:\n", getwd(), "\n\n")
-cat("Files in this folder:\n")
-print(list.files())
+cat("Files in", data_dir, ":\n")
+print(list.files(data_dir))
 
 if (!file.exists(count_file)) {
-  stop("Cannot find ", count_file, " in ", getwd(),
-       ". Put the count file in this folder or change count_file / data_dir.")
+  stop("Cannot find ", count_file, " (working directory: ", getwd(),
+       "). Put the count file there or change data_dir.")
 }
 if (!file.exists(pheno_file)) {
-  stop("Cannot find ", pheno_file, " in ", getwd(),
-       ". Put the phenotype file in this folder or change pheno_file / data_dir.")
+  stop("Cannot find ", pheno_file, " (working directory: ", getwd(),
+       "). Put the phenotype file there or change data_dir.")
 }
 ```
 
@@ -175,7 +175,7 @@ summary(res)
 ## Export
 
 ```{r write-output}
-write.csv(as.data.frame(res), "RES_DESEQ2_Comparison2.csv")
+write.csv(as.data.frame(res), file.path(results_dir, "RES_DESEQ2_Comparison2.csv"))
 ```
 
 ---
