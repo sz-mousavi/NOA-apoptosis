@@ -594,13 +594,18 @@ FeaturePlot(CData, features = unname(DDX4)) +
 Several gene sets were tested during the original analysis. Keep the set relevant to the figure being generated.
 
 ```{r candidate-genes}
-
+# TNF-receptor signaling genes
 tnfr_genes <- c("TNFRSF1A", "RIPK1", "TRADD")
+
+# To plot a different gene set, define another vector of gene symbols
+# here (e.g. my_genes <- c("GENE1", "GENE2")) and assign it below.
 ```
 
-Choose the gene set for the current analysis.
+Choose the gene set for the current analysis. `selected_genes` is defined here; it is set to `tnfr_genes` by default.
 
 ```{r choose-gene-set}
+selected_genes <- tnfr_genes
+
 Genes <- selected_genes
 EnsGenes <- map_to_ensembl(Genes)
 ```
