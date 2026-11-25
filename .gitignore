@@ -1,0 +1,18 @@
+# R / RStudio
+.Rhistory
+.RData
+*.rds
+*.RDS
+.Rproj.user/
+
+# Data and results (not stored in the repository)
+data/
+results/
+
+# Knitted output and caches
+*.html
+*_files/
+*_cache/
+
+# OS
+.DS_Store
